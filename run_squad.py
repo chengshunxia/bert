@@ -34,6 +34,7 @@ from tensorflow.python.ipu import utils, scopes
 from tensorflow.python.ipu.optimizers import sharded_optimizer
 from tensorflow.python.training import gradient_descent
 import pdb
+from tensorflow.python.ipu.scopes import ipu_scope
 
 flags = tf.flags
 
@@ -107,7 +108,7 @@ flags.DEFINE_float(
 flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
+flags.DEFINE_integer("iterations_per_loop", 1,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_integer(
@@ -124,7 +125,7 @@ flags.DEFINE_bool("use_fp16", False, "Whether to use half precision float to tra
 
 flags.DEFINE_bool("use_ipu", False, "Whether to use Graphcore IPU.")
 
-flags.DEFINE_bool("ipu_profiling", False, "Whether to enable profiling for Graphcore IPU.")
+flags.DEFINE_bool("ipu_profiling", True, "Whether to enable profiling for Graphcore IPU.")
 
 flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
 
@@ -171,6 +172,10 @@ flags.DEFINE_float(
     "null_score_diff_threshold", 0.0,
     "If null_score - best_non_null is greater than the threshold predict null.")
 
+#true to use virtul ipu
+IPU_MODEL = False
+if IPU_MODEL:
+    os.environ['TF_POPLAR_FLAGS'] = "--use_ipu_model"
 
 class SquadExample(object):
   """A single training/test example for simple sequence classification.
@@ -258,16 +263,25 @@ def create_estimator_wrapper(FLAGS, model_fn, bert_config):
 
 def create_ipu_estimator(FLAGS, model_fn, bert_config):
   ipu_options = ipu.utils.create_ipu_config(
-                   profiling=FLAGS.ipu_profiling,
-                   use_poplar_text_report=FLAGS.ipu_profiling,
-                   profile_execution=FLAGS.ipu_profiling)
+                   profiling=True,
+                   use_poplar_text_report=False,
+                   #profiling=FLAGS.ipu_profiling,
+                   #use_poplar_text_report=FLAGS.ipu_profiling,
+                   profile_execution=FLAGS.ipu_profiling,
+                   report_directory='./report')
 
   required_ipus = calculate_required_ipus(bert_config)
 
-  ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0,23"})
-  ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.23"})
+  ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0.1"})
+  ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.1"})
   ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
+  ipu.utils.set_optimization_options(ipu_options, gather_simplifier=False)
+  print('------ipu_options-----', ipu_options.enable_gather_simplifier)
   cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
+
+  from tensorflow.core.protobuf import rewriter_config_pb2
+  sess_cfg = tf.ConfigProto()
+  sess_cfg.graph_options.rewrite_options.memory_optimization = (rewriter_config_pb2.RewriterConfig.OFF)
 
   ipu_run_config = ipu.ipu_run_config.IPURunConfig(
                      iterations_per_loop=FLAGS.iterations_per_loop,
@@ -276,15 +290,27 @@ def create_ipu_estimator(FLAGS, model_fn, bert_config):
 
   config = ipu.ipu_run_config.RunConfig(
                     ipu_run_config=ipu_run_config,
+                    session_config=sess_cfg,
                     log_step_count_steps=FLAGS.ipu_log_interval,
                     save_summary_steps=FLAGS.ipu_summary_interval,
                     model_dir=FLAGS.output_dir)
 
-  return ipu.ipu_estimator.IPUEstimator(
+  if (FLAGS.init_checkpoint):
+    warm_start_settings = tf.estimator.WarmStartSettings(
+      ckpt_to_initialize_from=FLAGS.init_checkpoint,
+      vars_to_warm_start = ".*bert*.*"
+    )
+    return ipu.ipu_estimator.IPUEstimator(
           config=config,
           model_fn=model_fn,
           params={"learning_rate": FLAGS.learning_rate,
-          "batch_size":FLAGS.train_batch_size})
+          "batch_size":FLAGS.train_batch_size},warm_start_from=warm_start_settings)
+  else:
+    return ipu.ipu_estimator.IPUEstimator(
+            config=config,
+            model_fn=model_fn,
+            params={"learning_rate": FLAGS.learning_rate,
+            "batch_size":FLAGS.train_batch_size})
 
 def create_estimator(FLAGS, model_fn, bert_config):
   tpu_cluster_resolver = None
@@ -645,12 +671,12 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
 
   final_hidden = model.get_sequence_output()
 
-  final_hidden_shape = modeling.get_shape_list(final_hidden, expected_rank=3)
+  final_hidden_shape = modeling_ipu.get_shape_list(final_hidden, expected_rank=3)
   batch_size = final_hidden_shape[0]
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
 
-  with scopes.ipu_shard(1):
+  with scopes.ipu_shard(7):
     output_weights = tf.get_variable(
         "cls/squad/output_weights", [2, hidden_size],
         dtype = bert_config.dtype,
@@ -673,12 +699,17 @@ def create_model_ipu(bert_config, is_training, input_ids, input_mask, segment_id
 
     (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
 
-  return (start_logits, end_logits)
+  input_ids = model.get_input_id()
+  input_mask = model.get_input_mask()
+  token_type_ids = model.get_token_type_ids()
+  embedding_output = model.get_embedding_output()
+  embedding_lookup = model.get_embedding_lookup()
+  return (start_logits, end_logits, final_hidden, input_ids, input_mask, token_type_ids,embedding_output, embedding_lookup)
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                  use_one_hot_embeddings):
   """Creates a classification model."""
-  model = modeling.BertModel(
+  model = modeling_ipu.BertModel(
       config=bert_config,
       is_training=is_training,
       input_ids=input_ids,
@@ -688,7 +719,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
   final_hidden = model.get_sequence_output()
 
-  final_hidden_shape = modeling.get_shape_list(final_hidden, expected_rank=3)
+  final_hidden_shape = modeling_ipu.get_shape_list(final_hidden, expected_rank=3)
   batch_size = final_hidden_shape[0]
   seq_length = final_hidden_shape[1]
   hidden_size = final_hidden_shape[2]
@@ -735,7 +766,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
 
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-    (start_logits, end_logits) = create_model_ipu(
+    (start_logits, end_logits, final_hidden, input_ids, input_mask, token_type_ids,embedding_output, embedding_lookup) = create_model_ipu(
         bert_config=bert_config,
         is_training=is_training,
         input_ids=input_ids,
@@ -743,15 +774,17 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
         segment_ids=segment_ids,
         use_one_hot_embeddings=False)
 
+    '''
     tvars = tf.trainable_variables()
-
     initialized_variable_names = {}
     scaffold_fn = None
     if init_checkpoint:
       (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      ) = modeling_ipu.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
       tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
+      print("######################################################")
+      print(assignment_map)
+      print("######################################################")
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
       init_string = ""
@@ -759,10 +792,12 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
         init_string = ", *INIT_FROM_CKPT*"
       tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
                       init_string)
+                      '''
+                      
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      seq_length = modeling.get_shape_list(input_ids)[1]
+      seq_length = modeling_ipu.get_shape_list(input_ids)[1]
 
       def compute_loss(logits, positions):
         one_hot_positions = tf.one_hot(
@@ -774,7 +809,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
       start_positions = features["start_positions"]
       end_positions = features["end_positions"]
 
-      with scopes.ipu_shard(1):
+      with scopes.ipu_shard(7):
         start_loss = compute_loss(start_logits, start_positions)
         end_loss = compute_loss(end_logits, end_positions)
 
@@ -782,7 +817,7 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
 
       opt = sharded_optimizer.ShardedOptimizer(
                                         gradient_descent.GradientDescentOptimizer(learning_rate))
-      train_op = opt.minimize(total_loss)
+      train_op = opt.minimize(total_loss, aggregation_method=tf.AggregationMethod.ADD_N)
 
       output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
@@ -793,6 +828,12 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
           "unique_ids": unique_ids,
           "start_logits": start_logits,
           "end_logits": end_logits,
+          "final_hidden":final_hidden,
+          "input_ids":input_ids, 
+          "input_mask":input_mask, 
+          "token_type_ids":token_type_ids,
+          "embedding_output":embedding_output,
+          "embedding_lookup":embedding_lookup,
       }
       output_spec = tf.estimator.EstimatorSpec(
           mode=mode, predictions=predictions)
@@ -836,7 +877,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     scaffold_fn = None
     if init_checkpoint:
       (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      ) = modeling_ipu.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
       if use_tpu:
 
         def tpu_scaffold():
@@ -857,7 +898,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      seq_length = modeling.get_shape_list(input_ids)[1]
+      seq_length = modeling_ipu.get_shape_list(input_ids)[1]
 
       def compute_loss(logits, positions):
         one_hot_positions = tf.one_hot(
@@ -930,14 +971,13 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
-
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
+
     d = tf.data.TFRecordDataset(input_file)
     if is_training:
       d = d.repeat()
       d = d.shuffle(buffer_size=100)
-
     d = d.apply(
         tf.contrib.data.map_and_batch(
             lambda record: _decode_record(record, name_to_features),
@@ -1341,7 +1381,7 @@ def validate_flags_or_throw(bert_config):
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config = modeling_ipu.BertConfig.from_json_file(FLAGS.bert_config_file)
   bert_config.attention_layers_per_ipu = FLAGS.attention_layers_per_ipu
   if FLAGS.use_fp16:
     bert_config.dtype = tf.float16
@@ -1384,8 +1424,8 @@ def main(_):
         num_warmup_steps=num_warmup_steps,
         use_tpu=FLAGS.use_tpu,
         use_one_hot_embeddings=FLAGS.use_tpu)
-
-  estimator = create_estimator_wrapper(FLAGS, model_fn, bert_config)
+  with ipu_scope("/device:IPU:0"):
+    estimator = create_estimator_wrapper(FLAGS, model_fn, bert_config)
 
   if FLAGS.do_train:
     # We write to a temporary file to avoid storing very large constant tensors
@@ -1419,7 +1459,7 @@ def main(_):
 
   if FLAGS.do_predict:
     eval_examples = read_squad_examples(
-        input_file=FLAGS.predict_file, is_training=False)
+        input_file=FLAGS.predict_file,is_training=False)
 
     eval_writer = FeatureWriter(
         filename=os.path.join(FLAGS.output_dir, "eval.tf_record"),
@@ -1451,18 +1491,53 @@ def main(_):
         input_file=eval_writer.filename,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
-        drop_remainder=False)
+        drop_remainder=True)
 
     # If running eval on the TPU, you will need to specify the number of
     # steps.
     all_results = []
     for result in estimator.predict(
-        predict_input_fn, yield_single_examples=True):
-      if len(all_results) % 1000 == 0:
+            predict_input_fn,
+            yield_single_examples=True,
+            num_predictions=len(eval_features),
+            checkpoint_path=FLAGS.init_checkpoint):
+      if len(all_results) % 100 == 0:
         tf.logging.info("Processing example: %d" % (len(all_results)))
+
+      
       unique_id = int(result["unique_ids"])
       start_logits = [float(x) for x in result["start_logits"].flat]
       end_logits = [float(x) for x in result["end_logits"].flat]
+
+      '''
+      sequence_output = [float(x) for x in result["final_hidden"].flat]
+      input_ids = [float(x) for x in result["input_ids"].flat]
+      input_mask = [float(x) for x in result["input_mask"].flat]
+      token_type_ids = [float(x) for x in result["token_type_ids"].flat]  
+      embedding_output = [float(x) for x in result["embedding_output"].flat]
+      embedding_lookup = [float(x) for x in result["embedding_lookup"].flat]
+
+      print("unique_id"+str(unique_id))
+      print("len:"+str(len(start_logits))+" start_logits"+str(start_logits))
+      print("len:"+str(len(end_logits))+" end_logits"+str(end_logits))
+
+      embedding_str=''
+      for item in embedding_output:
+        embedding_str += str(item)+'\n'
+      embedding_lookup_str=''
+      for item in embedding_lookup:
+        embedding_lookup_str += str(item)+'\n'    
+      str_result = "sequence_output:"+str(sequence_output)+'\n' \
+      +"input_ids:"+str(input_ids)+'\n' \
+      +"input_mask:"+str(input_mask)+'\n' \
+      +"token_type_ids:"+str(token_type_ids)+'\n' \
+      +"embedding_output:"+embedding_str+'\n' \
+      +"embedding_lookup:"+embedding_lookup_str+'\n'
+      with open("./ipu-result.txt","w") as wrfile:
+        wrfile.write(str_result)  
+      # break
+      '''
+
       all_results.append(
           RawResult(
               unique_id=unique_id,
