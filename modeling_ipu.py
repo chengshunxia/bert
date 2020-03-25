@@ -29,6 +29,7 @@ import tensorflow as tf
 from tensorflow.python import ipu
 from tensorflow.python.ipu import utils, scopes
 from tensorflow.python.ipu import normalization_ops
+from tensorflow.python.ipu.ops.embedding_ops import embedding_lookup as embedding_lookup_ipu
 
 
 class BertConfig(object):
@@ -87,7 +88,7 @@ class BertConfig(object):
       self.dtype = tf.float16
     else:
       self.dtype = tf.float32
-    self.attention_layers_per_ipu = 1
+    self.attention_layers_per_ipu = attention_layers_per_ipu
 
   @classmethod
   def from_dict(cls, json_object):
@@ -163,6 +164,7 @@ class BertModel(object):
       ValueError: The config is invalid or one of the input tensor shapes
         is invalid.
     """
+    config.embedding_size = config.hidden_size
     config = copy.deepcopy(config)
     if not is_training:
       config.hidden_dropout_prob = 0.0
@@ -181,21 +183,17 @@ class BertModel(object):
     #initial split bert model into multiple IPUs
     #words embedding will be put on ipu_shard(0)
     #positional/segment embedding will be put on ipu_shard(1)
-    self.input_ids = input_ids
-    self.input_mask = input_mask
-    self.token_type_ids = token_type_ids
 
-    embedding_shard_placement = { "words_embedding": 0,
+    self.embedding_shard_placement = { "words_embedding": 0,
             "positional_segment_embedding": 1,
             }
-    attention_shard_placement = [(int(math.floor(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
+    self.attention_shard_placement = [(int(math.floor(i/config.attention_layers_per_ipu)) + 2) for i in range(0,config.num_hidden_layers)]
 
-    print('-----ipu_shard placement----', embedding_shard_placement)
     with tf.variable_scope(scope, default_name="bert"):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
-        with scopes.ipu_shard(embedding_shard_placement["words_embedding"]):
-          self.embedding_output = embedding_lookup(
+        with scopes.ipu_shard(self.embedding_shard_placement["words_embedding"]):
+          self.embedding_table,self.embedding_output = embedding_lookup(
               input_ids=input_ids,
               vocab_size=config.vocab_size,
               embedding_size=config.hidden_size,
@@ -207,7 +205,7 @@ class BertModel(object):
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
-        with scopes.ipu_shard(embedding_shard_placement["positional_segment_embedding"]):
+        with scopes.ipu_shard(self.embedding_shard_placement["positional_segment_embedding"]):
           self.embedding_output = embedding_postprocessor(
               input_tensor=self.embedding_output,
               use_token_type=True,
@@ -232,7 +230,7 @@ class BertModel(object):
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
         self.sequence_output = transformer_model(
-            attention_shard_placement,
+            self.attention_shard_placement,
             input_tensor=self.embedding_output,
             attention_mask=attention_mask,
             hidden_size=config.hidden_size,
@@ -248,17 +246,6 @@ class BertModel(object):
 
       #comment following line since we did not return all layer from tranformer_model
       #self.sequence_output = self.all_encoder_layers[-1]
-      print('----attention_shard_placement------', attention_shard_placement)
-      print('---sequence_output-----', self.sequence_output)
-
-  def get_input_id(self):
-    return self.input_ids
-  def get_input_mask(self):
-    return self.input_mask
-  def get_token_type_ids(self):
-    return self.token_type_ids
-  def get_embedding_lookup(self):
-    return self.embedding_lookup
 
   def get_sequence_output(self):
     """Gets final hidden layer of encoder.
@@ -282,11 +269,7 @@ class BertModel(object):
       then performing layer normalization. This is the input to the transformer.
     """
     return self.embedding_output
-
-  def get_embedding_table(self):
-    return self.embedding_table
-
-
+  
 def gelu(x):
   """Gaussian Error Linear Unit.
 
@@ -451,18 +434,13 @@ def embedding_lookup(input_ids,
     output = tf.gather(embedding_table, flat_input_ids)
   """
 
-  #output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
-  output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
+  output = embedding_lookup_ipu(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
+  #output = tf.nn.embedding_lookup(embedding_table,flat_input_ids, name='emb_lookup_ipu_words')
   input_shape = get_shape_list(input_ids)
 
   output = tf.reshape(output,
                       input_shape[0:-1] + [input_shape[-1] * embedding_size])
-  print('----flat_input_ids----', flat_input_ids)
-  print('----output----', output)
-  print('----embedding_table----', embedding_table)
-  print('----one-hot embedding----', use_one_hot_embeddings, dtype)
-
-  return output
+  return embedding_table,output
 
 
 def embedding_postprocessor(input_tensor,
@@ -875,7 +853,6 @@ def transformer_model(shard_placement,
   if do_return_all_layers:
     all_layer_outputs = []
 
-  print('----shard_placement----', shard_placement)
   for layer_idx in range(num_hidden_layers):
     with scopes.ipu_shard(shard_placement[layer_idx]):
       with tf.variable_scope("layer_%d" % layer_idx):

@@ -794,7 +794,6 @@ def model_fn_builder_ipu(bert_config,init_checkpoint,
                       init_string)
                       '''
                       
-
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
       seq_length = modeling_ipu.get_shape_list(input_ids)[1]

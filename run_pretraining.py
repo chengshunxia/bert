@@ -19,9 +19,20 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import sys
 import modeling
+import modeling_ipu
 import optimization
 import tensorflow as tf
+import math
+import pdb
+
+from tensorflow.python.ipu.scopes import ipu_scope
+from tensorflow.python.ipu import utils, scopes
+from tensorflow.python import ipu
+
+from tensorflow.python.ipu.optimizers import sharded_optimizer
+from tensorflow.python.training import gradient_descent
 
 flags = tf.flags
 
@@ -61,9 +72,9 @@ flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
-flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
+flags.DEFINE_integer("train_batch_size", 1, "Total batch size for training.")
 
-flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
+flags.DEFINE_integer("eval_batch_size", 1, "Total batch size for eval.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
@@ -79,7 +90,17 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
-flags.DEFINE_bool("use_fp16", False, "Whether to user half precision float to train.")
+flags.DEFINE_bool("use_fp16", True, "Whether to use half precision float to train.")
+
+flags.DEFINE_bool("use_ipu", False, "Whether to use Graphcore IPU.")
+
+flags.DEFINE_bool("ipu_profiling", False, "Whether to enable profiling for Graphcore IPU.")
+
+flags.DEFINE_integer("ipu_log_interval", 100, "Interval at which to log progress.")
+
+flags.DEFINE_integer("ipu_summary_interval", 1, "Interval at which to write summaries.")
+
+flags.DEFINE_integer("attention_layers_per_ipu", 1 , "How many attention layers per Graphcore IPU.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
@@ -107,31 +128,142 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+def calculate_required_ipus(bert_config):
+  required_ipus = int(math.ceil(float(bert_config.num_hidden_layers) / bert_config.attention_layers_per_ipu)) + 2
+  num_ipus_list = [2,4,8,16]
+  for nums in num_ipus_list:
+    if nums >= required_ipus:
+      return nums
+  print ("Cannot meet the IPU resource allocation request, you required %d" % (required_ipus))
+  sys.exit(1)
+
 def create_estimator(FLAGS, model_fn, bert_config):
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+    if FLAGS.use_ipu: 
+        return create_ipu_estimator(FLAGS, model_fn, bert_config)
+    else:
+        return create_tpu_estimator(FLAGS, model_fn,)
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+def create_tpu_estimator(FLAGS,model_fn):
+    tpu_cluster_resolver = None
+    if FLAGS.use_tpu and FLAGS.tpu_name:
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+          FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  return tf.contrib.tpu.TPUEstimator(
+    is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+    run_config = tf.compat.v1.estimator.tpu.RunConfig(
+        cluster=tpu_cluster_resolver,
+        master=FLAGS.master,
+        model_dir=FLAGS.output_dir,
+        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
+        iterations_per_loop=FLAGS.iterations_per_loop,
+        num_shards=FLAGS.num_tpu_cores,
+        per_host_input_for_training=is_per_host))
+    return tf.compat.v1.estimator.tpu.TPUEstimator(
       use_tpu=FLAGS.use_tpu,
       model_fn=model_fn,
       config=run_config,
       train_batch_size=FLAGS.train_batch_size,
       eval_batch_size=FLAGS.eval_batch_size)
+
+def create_ipu_estimator(FLAGS, model_fn, bert_config):
+    ipu_options = ipu.utils.create_ipu_config(
+        profiling=FLAGS.ipu_profiling,
+        use_poplar_text_report=False,
+        profile_execution=FLAGS.ipu_profiling
+    )
+
+    required_ipus = calculate_required_ipus(bert_config)
+
+    ipu_options = ipu.utils.set_convolution_options(ipu_options, {"availableMemoryProportion": "0,23"})
+    ipu_options = ipu.utils.set_matmul_options(ipu_options,{"availableMemoryProportion": "0.23"})
+    ipu.utils.set_recomputation_options(ipu_options, allow_recompute=True)
+    
+    cfg = ipu.utils.auto_select_ipus(ipu_options, num_ipus=required_ipus)
+
+    ipu_run_config = ipu.ipu_run_config.IPURunConfig(
+        iterations_per_loop=FLAGS.iterations_per_loop,
+        ipu_options=ipu_options,
+        num_shards=required_ipus,
+    )
+
+    config = ipu.ipu_run_config.RunConfig(
+        ipu_run_config=ipu_run_config,
+        log_step_count_steps=FLAGS.ipu_log_interval,
+        save_summary_steps=FLAGS.ipu_summary_interval,
+        model_dir=FLAGS.output_dir,
+    )
+
+    return ipu.ipu_estimator.IPUEstimator(
+        config=config,
+        model_fn=model_fn,
+        params={"learning_rate": FLAGS.learning_rate,
+                "batch_size":FLAGS.train_batch_size},
+    )
+
+def model_fn_builder_ipu(bert_config, init_checkpoint, learning_rate,
+                     num_train_steps, num_warmup_steps):
+  """Returns `model_fn` closure for IPUEstimator."""
+  def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+    """The `model_fn` for TPUEstimator."""
+    tf.logging.info("*** Features ***")
+    for name in sorted(features.keys()):
+      tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+
+    input_ids = features["input_ids"]
+    input_mask = features["input_mask"]
+    segment_ids = features["segment_ids"]
+    masked_lm_positions = features["masked_lm_positions"]
+    masked_lm_ids = features["masked_lm_ids"]
+    masked_lm_weights = features["masked_lm_weights"]
+    next_sentence_labels = features["next_sentence_labels"]
+ 
+    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+        
+    model = modeling_ipu.BertModel(
+      config=bert_config,
+      is_training=is_training,
+      input_ids=input_ids,
+      input_mask=input_mask,
+      token_type_ids=segment_ids,
+      use_one_hot_embeddings=False)
+
+    sequence_output = model.get_sequence_output()
+    embedding_shard_placement = model.embedding_shard_placement
+    with scopes.ipu_shard(embedding_shard_placement["words_embedding"]):
+      (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+          bert_config,sequence_output, model.embedding_table,
+          masked_lm_positions, masked_lm_ids, masked_lm_weights,dtype=bert_config.dtype)
+
+    with scopes.ipu_shard(embedding_shard_placement["positional_segment_embedding"]):
+      with tf.variable_scope("pooler"):
+      # We "pool" the model by simply taking the hidden state corresponding
+      # to the first token. We assume that this has been pre-trained
+          first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
+         # pooled_output = tf.stop_gradient (tf.layers.dense(
+          pooled_output = tf.layers.dense(
+              first_token_tensor,
+              bert_config.hidden_size,
+              activation=tf.tanh,
+          #    kernel_initializer=modeling.create_initializer(args.initializer_range)))
+              kernel_initializer=modeling.create_initializer(bert_config.initializer_range))
+
+      ### caculate the loss
+      (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = get_next_sentence_output(
+          bert_config,pooled_output, next_sentence_labels,dtype=bert_config.dtype)
+
+      total_loss = masked_lm_loss + next_sentence_loss
+
+    opt = sharded_optimizer.ShardedOptimizer(
+                            gradient_descent.GradientDescentOptimizer(learning_rate))
+    train_op = opt.minimize(total_loss)
+        
+    output_spec = tf.estimator.EstimatorSpec(
+          mode=mode,
+          loss=total_loss,
+          train_op=train_op)
+    return output_spec
+  return model_fn
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -166,39 +298,14 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     (masked_lm_loss,
      masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
          bert_config, model.get_sequence_output(), model.get_embedding_table(),
-         masked_lm_positions, masked_lm_ids, masked_lm_weights)
+         masked_lm_positions, masked_lm_ids, masked_lm_weights,bert_config.dtype)
 
     (next_sentence_loss, next_sentence_example_loss,
      next_sentence_log_probs) = get_next_sentence_output(
-         bert_config, model.get_pooled_output(), next_sentence_labels)
+         bert_config, model.get_pooled_output(), next_sentence_labels,bert_config.dtype)
 
     total_loss = masked_lm_loss + next_sentence_loss
-
-    tvars = tf.trainable_variables()
-
-    initialized_variable_names = {}
-    scaffold_fn = None
-    if init_checkpoint:
-      (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-    tf.logging.info("**** Trainable Variables ****")
-    for var in tvars:
-      init_string = ""
-      if var.name in initialized_variable_names:
-        init_string = ", *INIT_FROM_CKPT*"
-      tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                      init_string)
-
+    
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
       train_op = optimization.create_optimizer(
@@ -265,7 +372,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
 
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
-                         label_ids, label_weights):
+                         label_ids, label_weights, dtype):
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
 
@@ -285,7 +392,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     # an output-only bias for each token.
     output_bias = tf.get_variable(
         "output_bias",
-        dtype=bert_config.dtype,
+        dtype=dtype,
         shape=[bert_config.vocab_size],
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
@@ -294,10 +401,10 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
     label_ids = tf.reshape(label_ids, [-1])
     label_weights = tf.reshape(label_weights, [-1])
-    if bert_config.dtype == tf.float16:
-      label_weights = tf.cast(label_weights,dtype=tf.float16)
+    label_weights = tf.cast(label_weights,dtype=dtype)
+
     one_hot_labels = tf.one_hot(
-        label_ids, depth=bert_config.vocab_size, dtype=bert_config.dtype)
+        label_ids, depth=bert_config.vocab_size, dtype=dtype)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -311,7 +418,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
   return (loss, per_example_loss, log_probs)
 
 
-def get_next_sentence_output(bert_config, input_tensor, labels):
+def get_next_sentence_output(bert_config, input_tensor, labels,dtype):
   """Get loss and log probs for the next sentence prediction."""
 
   # Simple binary classification. Note that 0 is "next sentence" and 1 is
@@ -319,20 +426,20 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
   with tf.variable_scope("cls/seq_relationship"):
     output_weights = tf.get_variable(
         "output_weights",
-        dtype=bert_config.dtype,
+        dtype=dtype,
         shape=[2, bert_config.hidden_size],
         initializer=modeling.create_initializer(bert_config.initializer_range))
     output_bias = tf.get_variable(
-        "output_bias",
-        dtype=bert_config.dtype,
-        shape=[2],
+        "output_bias", 
+        dtype=dtype,
+        shape=[2], 
         initializer=tf.zeros_initializer())
 
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
     log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
-    one_hot_labels = tf.one_hot(labels, depth=2, dtype=bert_config.dtype)
+    one_hot_labels = tf.one_hot(labels, depth=2, dtype=dtype)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
     return (loss, per_example_loss, log_probs)
@@ -443,6 +550,9 @@ def main(_):
     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+  bert_config.attention_layers_per_ipu = FLAGS.attention_layers_per_ipu
+  if FLAGS.use_fp16:
+    bert_config.dtype = tf.float16
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
 
@@ -454,7 +564,15 @@ def main(_):
   for input_file in input_files:
     tf.logging.info("  %s" % input_file)
 
-  model_fn = model_fn_builder(
+  if FLAGS.use_ipu:
+    model_fn = model_fn_builder_ipu(
+      bert_config=bert_config,
+      init_checkpoint=FLAGS.init_checkpoint,
+      learning_rate=FLAGS.learning_rate,
+      num_train_steps=FLAGS.num_train_steps,
+      num_warmup_steps=FLAGS.num_warmup_steps)
+  else:
+    model_fn = model_fn_builder(
       bert_config=bert_config,
       init_checkpoint=FLAGS.init_checkpoint,
       learning_rate=FLAGS.learning_rate,
@@ -463,7 +581,7 @@ def main(_):
       use_tpu=FLAGS.use_tpu,
       use_one_hot_embeddings=FLAGS.use_tpu)
 
-  estimator = create_estimator(FLAGS, model_fn, bert_config)
+  estimator = create_estimator(FLAGS,model_fn,bert_config)
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")
